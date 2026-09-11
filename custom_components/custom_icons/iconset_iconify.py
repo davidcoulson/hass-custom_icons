@@ -20,13 +20,17 @@ ICONIFY_REPO_URL = "https://github.com/iconify/icon-sets/archive/refs/heads/mast
 ICONIFY_REPO_FILENAME = "iconify-icon-sets-master.zip"
 
 
-def _save_file(path: str, data: str | bytes):
-    with open(path, "wb") as fp:
-        fp.write(data)
-
-
 def _load_file(path: str) -> zipfile.ZipFile:
     return zipfile.ZipFile(path)
+
+
+def _load_json(path: zipfile.Path):
+    with path.open() as fp:
+        return json.load(fp)
+
+
+def _write_chunk(fp, chunk: bytes) -> None:
+    fp.write(chunk)
 
 
 async def download_data(hass: HomeAssistant, force: bool = False):
@@ -40,16 +44,35 @@ async def download_data(hass: HomeAssistant, force: bool = False):
     if not force:
         return None
 
-    session = aiohttp.ClientSession = async_get_clientsession(hass)
+    # `session: aiohttp.ClientSession = ...` was previously written as
+    # `session = aiohttp.ClientSession = ...`, a chained assignment that
+    # replaced the aiohttp module's ClientSession *class* with a session
+    # *instance* for the lifetime of the Hass process - silently breaking
+    # any other integration that instantiates aiohttp.ClientSession()
+    # directly afterward.
+    session: aiohttp.ClientSession = async_get_clientsession(hass)
 
-    request = await session.get(url=ICONIFY_REPO_URL)
-    if request.status == 200:
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, _save_file, target, await request.read())
+    loop = asyncio.get_running_loop()
+    tmp_target = target + ".part"
 
-        return target
+    async with session.get(url=ICONIFY_REPO_URL) as request:
+        if request.status != 200:
+            return None
 
-    return None
+        # Stream to disk in chunks instead of `await request.read()` -
+        # this archive bundles every Iconify icon set (hundreds of MB),
+        # and reading it fully into memory before writing is what caused
+        # the memory-saturation reports on memory-constrained installs.
+        fp = await loop.run_in_executor(None, open, tmp_target, "wb")
+        try:
+            async for chunk in request.content.iter_chunked(1024 * 1024):
+                await loop.run_in_executor(None, _write_chunk, fp, chunk)
+        finally:
+            await loop.run_in_executor(None, fp.close)
+
+    await loop.run_in_executor(None, os.replace, tmp_target, target)
+
+    return target
 
 
 async def _get_data_files(hass: HomeAssistant) -> zipfile.Path:
@@ -82,7 +105,10 @@ class IconifySets(IconSetCollection):
             self.data_cache["/"] = await _get_data_files(hass)
         if not prefix in self.data_cache:
             data = self.data_cache["/"] / f"{prefix}.json"
-            self.data_cache[prefix] = json.load(data.open())
+            loop = asyncio.get_running_loop()
+            self.data_cache[prefix] = await loop.run_in_executor(
+                None, _load_json, data
+            )
 
         return self.data_cache[prefix]
 
